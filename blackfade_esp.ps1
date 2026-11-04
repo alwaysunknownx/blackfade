@@ -111,6 +111,8 @@ uintptr_t g_base=0;
 HWND g_overlay=nullptr,g_roblox=nullptr;
 std::atomic<bool> g_running{true};
 static HHOOK g_kbHook=nullptr;
+static HHOOK g_mouseHook=nullptr;
+static std::atomic<bool> g_mb5{false};
 static HDC g_mdc=nullptr;
 static HBITMAP g_bmp=nullptr;
 static int g_bmpW=0,g_bmpH=0;
@@ -266,6 +268,17 @@ static bool ShowLoginDialog(HINSTANCE hInst){
 }
 // ─────────────────────────────────────────────────────────────────────────────
 
+// ── Mouse hook — rastreia MB5 (XBUTTON2) de forma confiavel ─────────────────
+static LRESULT CALLBACK MouseProc(int code, WPARAM wp, LPARAM lp){
+    if(code == HC_ACTION){
+        MSLLHOOKSTRUCT* ms = (MSLLHOOKSTRUCT*)lp;
+        if(wp == WM_XBUTTONDOWN && HIWORD(ms->mouseData) == XBUTTON2) g_mb5 = true;
+        if(wp == WM_XBUTTONUP   && HIWORD(ms->mouseData) == XBUTTON2) g_mb5 = false;
+    }
+    return CallNextHookEx(g_mouseHook, code, wp, lp);
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
 static LRESULT CALLBACK KbProc(int code,WPARAM wp,LPARAM lp){
     if(code==HC_ACTION&&wp==WM_KEYDOWN){
         KBDLLHOOKSTRUCT* kb=(KBDLLHOOKSTRUCT*)lp;
@@ -361,9 +374,8 @@ static void PosThread(){
 // ── Triggerbot ───────────────────────────────────────────────────────────────
 static void TriggerThread(){
     while(g_running){
-        // MB4 (VK_XBUTTON1) ou MB5 (VK_XBUTTON2) segurado?
-        bool held = (GetAsyncKeyState(VK_XBUTTON1) & 0x8000) != 0 ||
-                    (GetAsyncKeyState(VK_XBUTTON2) & 0x8000) != 0;
+        // MB5 rastreado pelo hook de mouse (atomico, sem depender de GetAsyncKeyState)
+        bool held = g_mb5.load();
         if(!held){ Sleep(TRIGGER_POLL); continue; }
 
         if(!g_roblox){ Sleep(TRIGGER_POLL); continue; }
@@ -479,14 +491,16 @@ int WINAPI WinMain(HINSTANCE hInst,HINSTANCE,LPSTR,int){
     typedef BOOL(WINAPI*pSWDA)(HWND,DWORD);
     pSWDA SetWDA=(pSWDA)GetProcAddress(GetModuleHandleA("user32.dll"),"SetWindowDisplayAffinity");
     if(SetWDA)SetWDA(g_overlay,0x11);
-    g_kbHook=SetWindowsHookExA(WH_KEYBOARD_LL,KbProc,hInst,0);
+    g_kbHook   =SetWindowsHookExA(WH_KEYBOARD_LL, KbProc,   hInst,0);
+    g_mouseHook=SetWindowsHookExA(WH_MOUSE_LL,    MouseProc,hInst,0);
     std::thread(ChainThread).detach();
     std::thread(PosThread).detach();
     std::thread(RenderThread).detach();
     std::thread(TriggerThread).detach();
     MSG msg{};
     while(g_running&&GetMessageA(&msg,nullptr,0,0)){TranslateMessage(&msg);DispatchMessageA(&msg);}
-    if(g_kbHook){UnhookWindowsHookEx(g_kbHook);g_kbHook=nullptr;}
+    if(g_kbHook)   {UnhookWindowsHookEx(g_kbHook);   g_kbHook=nullptr;}
+    if(g_mouseHook){UnhookWindowsHookEx(g_mouseHook);g_mouseHook=nullptr;}
     if(g_overlay){DestroyWindow(g_overlay);g_overlay=nullptr;}
     CloseHandle(g_proc);
     return 0;
