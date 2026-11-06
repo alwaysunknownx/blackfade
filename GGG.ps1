@@ -4000,9 +4000,22 @@ static void LoadCfg(){
     if(f) f.read((char*)&cfg,sizeof(cfg));
 }
 
+static std::atomic<bool> g_gui_visible{true};
+
 static void Logic(){
+    bool ins_prev=false;
     while(g_run){
         std::this_thread::sleep_for(1ms);
+
+        // INSERT — toggle GUI visibility
+        bool ins_now=(GetAsyncKeyState(VK_INSERT)&0x8000)!=0;
+        if(ins_now && !ins_prev){
+            g_gui_visible=!g_gui_visible;
+            if(g_hwnd)
+                ShowWindow(g_hwnd, g_gui_visible ? SW_SHOWNOACTIVATE : SW_HIDE);
+        }
+        ins_prev=ins_now;
+
         uintptr_t dm=GetDM();if(!dm)continue;
         uintptr_t ws=RPM<uintptr_t>(dm+Off::DM_WS);if(!ws)continue;
         uintptr_t pl=Kid(dm,"Players");if(!pl)continue;
