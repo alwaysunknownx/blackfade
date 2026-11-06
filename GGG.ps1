@@ -27,6 +27,8 @@ Set-Content -Path $src -Encoding UTF8 -Value @'
 #include <chrono>
 #include <algorithm>
 #include <fstream>
+#include <unordered_map>
+#include <cwctype>
 
 #pragma comment(lib,"gdiplus.lib")
 #pragma comment(lib,"dwmapi.lib")
@@ -3875,7 +3877,7 @@ static const unsigned char g_logo[] = {
 };
 static const size_t g_logo_sz = sizeof(g_logo);
 
-static const int WW=680, WH=720, SW=170, HH=50;
+static const int WW=640, WH=720, SW=188, HH=46;
 
 static HANDLE    g_proc  = nullptr;
 static uintptr_t g_base  = 0;
@@ -4171,28 +4173,40 @@ LRESULT CALLBACK ESPProc(HWND hw,UINT msg,WPARAM wp,LPARAM lp){
     return DefWindowProc(hw,msg,wp,lp);
 }
 
+// ============================================================================
+//  GUI - Matrix Hub style (GDI+ only, no external deps)
+//  layout: header (CONTROL PANEL + search + icon buttons) | sidebar | content
+// ============================================================================
 namespace C{
-    const Color Bg   {255,  8,  8,  8};
-    const Color Side {255, 12, 12, 12};
-    const Color Hdr  {255,  5,  5,  5};
-    const Color Item {255, 18, 18, 18};
-    const Color Acc  {255,  0,110,255};
-    const Color Txt  {255,210,210,230};
-    const Color Sub  {255, 95, 95,120};
-    const Color Sep  {255, 28, 28, 28};
-    const Color Brd  {255, 36, 36, 36};
-    const Color On   {255,  0,118,255};
-    const Color Off_ {255, 32, 32, 32};
+    const Color Bg   {255, 11, 16, 33};
+    const Color Side {255,  9, 13, 27};
+    const Color Hov  {255, 16, 23, 48};
+    const Color Act  {255, 18, 28, 60};
+    const Color Item {255, 14, 20, 42};
+    const Color Sep  {255, 22, 30, 56};
+    const Color Brd  {255, 30, 40, 72};
+    const Color Acc  {255, 62,132,247};
+    const Color AccBg{255, 17, 36, 84};
+    const Color Txt  {255,226,231,246};
+    const Color Val  {255,176,186,214};
+    const Color Sub  {255,108,119,156};
+    const Color Dim  {255, 84, 96,134};
+    const Color Off_ {255, 31, 39, 68};
+    const Color Knob {255,205,211,232};
     const Color Wht  {255,255,255,255};
+    const Color Red  {255,235, 87, 87};
 }
 
-static Font *fBig=nullptr,*fMed=nullptr,*fSm=nullptr,*fXS=nullptr;
+static const int RH=38, SEC_H=36, RX=WW-26, SLW=150, DDW=118, DDH=26;
+static const int NAV0=HH+68, NAVH=36, NAVSTEP=42;
+
+static Font *fTitle=nullptr,*fMed=nullptr,*fSm=nullptr,*fXS=nullptr;
 static void InitFonts(){
     static FontFamily ff(L"Segoe UI");
-    fBig=new Font(&ff,13,FontStyleBold,UnitPoint);
-    fMed=new Font(&ff,10,FontStyleRegular,UnitPoint);
-    fSm =new Font(&ff, 9,FontStyleRegular,UnitPoint);
-    fXS =new Font(&ff, 8,FontStyleRegular,UnitPoint);
+    fTitle=new Font(&ff,10.5f,FontStyleBold,UnitPoint);
+    fMed  =new Font(&ff, 9.5f,FontStyleRegular,UnitPoint);
+    fSm   =new Font(&ff, 8.5f,FontStyleRegular,UnitPoint);
+    fXS   =new Font(&ff, 7.5f,FontStyleRegular,UnitPoint);
 }
 
 static Image* LoadLogoFromMemory(){
@@ -4206,6 +4220,7 @@ static Image* LoadLogoFromMemory(){
     st->Release();return img;
 }
 
+// ---- primitives ------------------------------------------------------------
 static void FRR(Graphics&g,Color c,float x,float y,float w,float h,float r){
     SolidBrush b(c);
     if(r<.5f){g.FillRectangle(&b,RectF(x,y,w,h));return;}
@@ -4230,137 +4245,286 @@ static void Txt(Graphics&g,const wchar_t*s,Font*f,Color c,
     sf.SetTrimming(StringTrimmingEllipsisCharacter);
     g.DrawString(s,-1,f,RectF(x,y,w,h),&sf,&b);
 }
+static float TextW(Graphics&g,const wchar_t*s,Font*f){
+    StringFormat sf(StringFormat::GenericTypographic());
+    sf.SetFormatFlags(StringFormatFlagsMeasureTrailingSpaces|StringFormatFlagsNoWrap);
+    RectF r;g.MeasureString(s,-1,f,PointF(0,0),&sf,&r);return r.Width;
+}
+// letter-spaced text (GDI+ has no tracking) - returns end x
+static float TxtSp(Graphics&g,const wchar_t*s,Font*f,Color c,float x,float cy,float sp){
+    SolidBrush b(c);
+    StringFormat sf(StringFormat::GenericTypographic());
+    sf.SetFormatFlags(StringFormatFlagsMeasureTrailingSpaces|StringFormatFlagsNoWrap);
+    RectF hr;g.MeasureString(L"Ag",-1,f,PointF(0,0),&sf,&hr);
+    float ty=cy-hr.Height*.5f;
+    for(const wchar_t*p=s;*p;++p){
+        wchar_t ch[2]={*p,0};
+        g.DrawString(ch,1,f,PointF(x,ty),&sf,&b);
+        RectF m;g.MeasureString(ch,1,f,PointF(0,0),&sf,&m);
+        x+=m.Width+sp;
+    }
+    return x-sp;
+}
+static Color Lerp(Color a,Color b,float t){
+    return Color(255,
+        (BYTE)(a.GetR()+(b.GetR()-a.GetR())*t),
+        (BYTE)(a.GetG()+(b.GetG()-a.GetG())*t),
+        (BYTE)(a.GetB()+(b.GetB()-a.GetB())*t));
+}
+static int Wrap(int v,int n){return n>0?((v%n)+n)%n:0;}
 
+// ---- icons (vector, drawn with GDI+ paths) ---------------------------------
+enum{ICN_SEARCH,ICN_MON,ICN_BELL,ICN_GLOBE,ICN_GEAR,ICN_EYE,ICN_AIM,ICN_STAR,ICN_POWER,ICN_KEY,ICN_CHEV};
+static void Icon(Graphics&g,int id,float cx,float cy,float s,Color c,float w=1.5f){
+    Pen p(c,w);p.SetStartCap(LineCapRound);p.SetEndCap(LineCapRound);p.SetLineJoin(LineJoinRound);
+    SolidBrush b(c);
+    switch(id){
+    case ICN_SEARCH:{
+        float r=s*.32f,ox=cx-s*.08f,oy=cy-s*.08f;
+        g.DrawEllipse(&p,ox-r,oy-r,r*2,r*2);
+        g.DrawLine(&p,ox+r*.72f,oy+r*.72f,cx+s*.42f,cy+s*.42f);
+        break;}
+    case ICN_MON:{
+        float w2=s*.46f,h2=s*.30f,top=cy-h2-s*.08f;
+        DRR(g,c,cx-w2,top,w2*2,h2*2,s*.08f,w);
+        g.DrawLine(&p,cx,top+h2*2,cx,top+h2*2+s*.14f);
+        g.DrawLine(&p,cx-s*.17f,top+h2*2+s*.14f,cx+s*.17f,top+h2*2+s*.14f);
+        break;}
+    case ICN_BELL:{
+        GraphicsPath gp;
+        float w2=s*.32f,top=cy-s*.40f,bot=cy+s*.22f;
+        gp.AddArc(cx-w2,top,w2*2,w2*2,180,180);
+        gp.AddLine(cx+w2,top+w2,cx+w2+s*.07f,bot);
+        gp.AddLine(cx+w2+s*.07f,bot,cx-w2-s*.07f,bot);
+        gp.CloseFigure();
+        g.DrawPath(&p,&gp);
+        g.DrawArc(&p,cx-s*.11f,bot+s*.05f,s*.22f,s*.18f,0.f,180.f);
+        break;}
+    case ICN_GLOBE:{
+        float r=s*.42f;
+        g.DrawEllipse(&p,cx-r,cy-r,r*2,r*2);
+        g.DrawEllipse(&p,cx-r*.45f,cy-r,r*.9f,r*2);
+        g.DrawLine(&p,cx-r,cy,cx+r,cy);
+        break;}
+    case ICN_GEAR:{
+        float r=s*.27f;
+        g.DrawEllipse(&p,cx-r,cy-r,r*2,r*2);
+        g.DrawEllipse(&p,cx-r*.38f,cy-r*.38f,r*.76f,r*.76f);
+        Pen p2(c,w+.9f);p2.SetStartCap(LineCapRound);p2.SetEndCap(LineCapRound);
+        for(int i=0;i<8;i++){
+            float a=i*0.785398f;
+            g.DrawLine(&p2,cx+std::cos(a)*r*1.08f,cy+std::sin(a)*r*1.08f,
+                           cx+std::cos(a)*s*.42f,  cy+std::sin(a)*s*.42f);
+        }
+        break;}
+    case ICN_EYE:{
+        GraphicsPath gp;
+        float w2=s*.47f,h2=s*.30f;
+        gp.AddBezier(PointF(cx-w2,cy),PointF(cx-w2*.45f,cy-h2*1.5f),PointF(cx+w2*.45f,cy-h2*1.5f),PointF(cx+w2,cy));
+        gp.AddBezier(PointF(cx+w2,cy),PointF(cx+w2*.45f,cy+h2*1.5f),PointF(cx-w2*.45f,cy+h2*1.5f),PointF(cx-w2,cy));
+        g.DrawPath(&p,&gp);
+        float r=s*.14f;g.FillEllipse(&b,cx-r,cy-r,r*2,r*2);
+        break;}
+    case ICN_AIM:{
+        float r=s*.30f;
+        g.DrawEllipse(&p,cx-r,cy-r,r*2,r*2);
+        g.DrawLine(&p,cx,cy-s*.46f,cx,cy-r*.40f);
+        g.DrawLine(&p,cx,cy+r*.40f,cx,cy+s*.46f);
+        g.DrawLine(&p,cx-s*.46f,cy,cx-r*.40f,cy);
+        g.DrawLine(&p,cx+r*.40f,cy,cx+s*.46f,cy);
+        break;}
+    case ICN_STAR:{
+        PointF pts[10];float R=s*.47f,r2=s*.20f;
+        for(int i=0;i<10;i++){
+            float a=-1.570796f+i*0.628319f,rr=(i&1)?r2:R;
+            pts[i]=PointF(cx+std::cos(a)*rr,cy+std::sin(a)*rr+s*.03f);
+        }
+        g.FillPolygon(&b,pts,10);g.DrawPolygon(&p,pts,10);
+        break;}
+    case ICN_POWER:{
+        float r=s*.36f;
+        g.DrawArc(&p,cx-r,cy-r+s*.04f,r*2,r*2,-55.f,290.f);
+        g.DrawLine(&p,cx,cy-s*.44f,cx,cy-s*.04f);
+        break;}
+    case ICN_KEY:{
+        float w2=s*.5f,h2=s*.30f;
+        DRR(g,c,cx-w2,cy-h2,w2*2,h2*2,s*.09f,w*.8f);
+        for(int i=0;i<3;i++)g.FillRectangle(&b,RectF(cx-s*.30f+i*s*.24f,cy-s*.13f,s*.10f,s*.08f));
+        g.FillRectangle(&b,RectF(cx-s*.26f,cy+s*.04f,s*.52f,s*.08f));
+        break;}
+    case ICN_CHEV:{
+        PointF pts[3]={PointF(cx-s*.28f,cy-s*.12f),PointF(cx,cy+s*.16f),PointF(cx+s*.28f,cy-s*.12f)};
+        g.DrawLines(&p,pts,3);
+        break;}
+    }
+}
+
+// ---- state -----------------------------------------------------------------
 enum CK{CK_T,CK_S,CK_C};
-struct Ctrl{CK k;RECT r;bool*bp=nullptr;float*fp=nullptr;int*ip=nullptr;float mn=0,mx=1;int cnt=0;};
+struct Ctrl{
+    CK k=CK_T;RECT r{};
+    bool*bp=nullptr;float*fp=nullptr;int*ip=nullptr;
+    float mn=0,mx=1,tl=0,tw=1;int cnt=0,dec=0;
+    const wchar_t**opts=nullptr;const wchar_t*lbl=nullptr;
+};
 static std::vector<Ctrl> g_ctrls;
-static int g_tab=0,g_sy=0,g_msy=0;
+static int  g_tab=1,g_sy=0,g_msy=0;          // default tab = Aimbot (like the print)
+static int  g_mx=-1,g_my=-1;
 static Graphics* g_gfx=nullptr;
-static const int g_cx=SW,g_cw=WW-SW;
-struct Drag{bool on=false;float*fp=nullptr;RECT r{};float mn=0,mx=1;}g_drag;
+static std::wstring g_search;
+static bool g_sfocus=false,g_notif=true,g_busy=false;
+static std::wstring g_toast;
+static ULONGLONG g_toastT=0;
+struct Drag{bool on=false;float*fp=nullptr;float tl=0,tw=1,mn=0,mx=1;int dec=0;}g_drag;
+struct DD{bool on=false;RECT box{};int*ip=nullptr;const wchar_t**o=nullptr;int cnt=0;const wchar_t*lbl=nullptr;}g_dd;
 
 static int  CTS(int y){return HH+y-g_sy;}
 static bool Vis(int y,int h){int s=CTS(y);return s+h>HH&&s<WH;}
+static bool IsHov(int sy,int h=RH){
+    return !g_dd.on&&g_mx>=SW&&g_mx<WW&&g_my>=HH&&g_my<WH&&g_my>=sy&&g_my<sy+h;
+}
+static bool InR(const RECT&r,int x,int y){return x>=r.left&&x<r.right&&y>=r.top&&y<r.bottom;}
 
-static void DrawTog(const wchar_t*lbl,bool v,int sy){
-    Txt(*g_gfx,lbl,fMed,C::Txt,(float)(g_cx+16),(float)sy,(float)(g_cw-80),44);
-    float tx=g_cx+g_cw-62.f,ty=sy+(44-24)/2.f;
-    FRR(*g_gfx,v?C::On:C::Off_,tx,ty,44,24,12);
-    float tr=9.f,tpx=v?(tx+44-3-tr):(tx+3+tr);
-    FRR(*g_gfx,C::Wht,tpx-tr,ty+12-tr,tr*2,tr*2,tr);
-    FRR(*g_gfx,C::Sep,(float)(g_cx+8),(float)(sy+43),(float)(g_cw-16),1,0);
+static void Toast(const wchar_t*s,bool force=false){
+    if(!g_notif&&!force)return;
+    g_toast=s;g_toastT=GetTickCount64();
 }
-static void DrawSli(const wchar_t*lbl,float v,float mn,float mx,const wchar_t*u,int sy){
-    Txt(*g_gfx,lbl,fMed,C::Txt,(float)(g_cx+16),(float)(sy+2),(float)(g_cw-120),22);
-    wchar_t vb[32];swprintf(vb,32,L"%.1f %s",v,u?u:L"");
-    Txt(*g_gfx,vb,fMed,C::Acc,(float)(g_cx+g_cw-108),(float)(sy+2),92,22,StringAlignmentFar);
-    float tx=g_cx+16.f,tw=g_cw-32.f,ty=(float)(sy+38);
+static void ToastOnOff(const wchar_t*l,bool on){
+    std::wstring s=l;s+=on?L" enabled":L" disabled";Toast(s.c_str());
+}
+static bool Match(const wchar_t*l){
+    if(g_search.empty())return true;
+    std::wstring a(l),b(g_search);
+    for(auto&c:a)c=(wchar_t)std::towlower(c);
+    for(auto&c:b)c=(wchar_t)std::towlower(c);
+    return a.find(b)!=std::wstring::npos;
+}
+// smooth value for animations (toggle knob etc.)
+static std::unordered_map<const void*,float> g_anim;
+static float Anim(const void*k,float tgt){
+    auto it=g_anim.find(k);
+    if(it==g_anim.end()){g_anim[k]=tgt;return tgt;}
+    float&a=it->second;
+    if(std::fabs(tgt-a)<0.01f)a=tgt;
+    else{a+=(tgt-a)*0.32f;g_busy=true;}
+    return a;
+}
+
+// ---- layout helpers --------------------------------------------------------
+struct HdrRects{RECT search,mon,bell,globe,gear;};
+static HdrRects HdrR(){
+    const int bs=30,gy=(HH-bs)/2;HdrRects h;
+    h.gear  ={WW-14-bs,gy,WW-14,gy+bs};
+    h.globe ={h.gear.left-6-bs,gy,h.gear.left-6,gy+bs};
+    h.bell  ={h.globe.left-18-bs,gy,h.globe.left-18,gy+bs};
+    h.mon   ={h.bell.left-6-bs,gy,h.bell.left-6,gy+bs};
+    h.search={h.mon.left-12-176,(HH-28)/2,h.mon.left-12,(HH-28)/2+28};
+    return h;
+}
+static RECT NavR(int i){int ty=NAV0+i*NAVSTEP;RECT r={8,ty,SW-8,ty+NAVH};return r;}
+static RECT ExitR(){RECT r={8,WH-92,SW-8,WH-92+NAVH};return r;}
+static RECT DDRect(){
+    const int ih=28;
+    int x=g_dd.box.left,w=g_dd.box.right-g_dd.box.left,h=g_dd.cnt*ih+8;
+    int y=g_dd.box.bottom+4;
+    if(y+h>WH-6)y=g_dd.box.top-4-h;
+    RECT r={x,y,x+w,y+h};return r;
+}
+
+// ---- row widgets -----------------------------------------------------------
+static void RowBg(int sy){
+    if(IsHov(sy))FRR(*g_gfx,C::Hov,(float)(SW+6),(float)(sy+1),(float)(WW-SW-20),(float)(RH-2),8);
+}
+static void DrawKeyPill(const wchar_t*k,float rx,int sy){
+    Graphics&g=*g_gfx;
+    float tw=TextW(g,k,fXS),w=8+14+5+tw+9,h=22,x=rx-w,y=sy+(RH-h)*.5f;
+    FRR(g,C::Item,x,y,w,h,7);DRR(g,C::Brd,x,y,w,h,7);
+    Icon(g,ICN_KEY,x+8+7,y+h*.5f,14,C::Sub,1.2f);
+    Txt(g,k,fXS,C::Sub,x+8+14+5,y,tw+6,h);
+}
+static void DrawTog(const wchar_t*lbl,const bool*bp,int sy,const wchar_t*key){
+    Graphics&g=*g_gfx;
+    RowBg(sy);
+    Txt(g,lbl,fMed,C::Txt,(float)(SW+16),(float)sy,260,(float)RH);
+    float tw=42,th=22,tx=(float)(RX-42),ty=sy+(RH-th)*.5f;
+    float t=Anim(bp,*bp?1.f:0.f);
+    FRR(g,Lerp(C::Off_,C::Acc,t),tx,ty,tw,th,th*.5f);
+    float kr=8.f,kx=tx+3+kr+(tw-6-kr*2)*t,ky=ty+th*.5f;
+    FRR(g,Lerp(C::Knob,C::Wht,t),kx-kr,ky-kr,kr*2,kr*2,kr);
+    if(key)DrawKeyPill(key,tx-10,sy);
+}
+static void DrawSli(const wchar_t*lbl,float v,float mn,float mx,const wchar_t*u,int dec,int sy,float tl,float tw){
+    Graphics&g=*g_gfx;
+    RowBg(sy);
+    Txt(g,lbl,fMed,C::Txt,(float)(SW+16),(float)sy,tl-(SW+16)-8,(float)RH);
+    wchar_t vb[48];
+    if(dec<=0)swprintf(vb,48,L"%.0f%ls",v,u?u:L"");
+    else      swprintf(vb,48,L"%.*f%ls",dec,v,u?u:L"");
+    Txt(g,vb,fSm,C::Val,(float)(RX-58),(float)sy,58,(float)RH,StringAlignmentFar);
+    float cy=sy+RH*.5f;
     float t=(std::max)(0.f,(std::min)(1.f,(v-mn)/(mx-mn)));
-    FRR(*g_gfx,C::Off_,tx,ty,tw,4,2);
-    if(t>0.001f)FRR(*g_gfx,C::On,tx,ty,tw*t,4,2);
-    float px=tx+tw*t;
-    FRR(*g_gfx,C::On,px-7,ty-5,14,14,7);
-    FRR(*g_gfx,C::Wht,px-5,ty-3,10,10,5);
-    FRR(*g_gfx,C::Sep,(float)(g_cx+8),(float)(sy+55),(float)(g_cw-16),1,0);
+    FRR(g,C::Off_,tl,cy-2,tw,4,2);
+    if(t>0.001f)FRR(g,C::Acc,tl,cy-2,tw*t,4,2);
+    float px=tl+tw*t;
+    FRR(g,C::Knob,px-7,cy-7,14,14,7);
 }
-static void DrawCyc(const wchar_t*lbl,int v,const wchar_t**opts,int cnt,int sy){
-    Txt(*g_gfx,lbl,fMed,C::Txt,(float)(g_cx+16),(float)sy,(float)(g_cw/2),44);
-    float bx=g_cx+g_cw-162.f,by=sy+8.f,bw=146.f,bh=28.f;
-    FRR(*g_gfx,C::Item,bx,by,bw,bh,7);
-    DRR(*g_gfx,C::Brd,bx,by,bw,bh,7);
-    Txt(*g_gfx,L"\u276E",fMed,C::Acc,bx,by,28,bh,StringAlignmentCenter);
-    Txt(*g_gfx,opts[v%cnt],fMed,C::Txt,bx+28,by,bw-56,bh,StringAlignmentCenter);
-    Txt(*g_gfx,L"\u276F",fMed,C::Acc,bx+bw-28,by,28,bh,StringAlignmentCenter);
-    FRR(*g_gfx,C::Sep,(float)(g_cx+8),(float)(sy+43),(float)(g_cw-16),1,0);
+static void DrawCyc(const wchar_t*lbl,int v,const wchar_t**opts,int cnt,int sy,const RECT&br,bool open){
+    Graphics&g=*g_gfx;
+    RowBg(sy);
+    Txt(g,lbl,fMed,C::Txt,(float)(SW+16),(float)sy,260,(float)RH);
+    float bx=(float)br.left,by=(float)br.top,bw=(float)(br.right-br.left),bh=(float)(br.bottom-br.top);
+    bool hv=!g_dd.on&&InR(br,g_mx,g_my);
+    FRR(g,C::Item,bx,by,bw,bh,8);
+    DRR(g,open?C::Acc:(hv?Lerp(C::Brd,C::Acc,.35f):C::Brd),bx,by,bw,bh,8);
+    Txt(g,opts[Wrap(v,cnt)],fMed,C::Txt,bx+11,by,bw-34,bh);
+    Icon(g,ICN_CHEV,bx+bw-15,by+bh*.5f,12,C::Sub,1.4f);
 }
 static void DrawSec(const wchar_t*t,int sy){
-    Txt(*g_gfx,t,fXS,C::Sub,(float)(g_cx+16),(float)(sy+8),120,20);
-    FRR(*g_gfx,C::Sep,(float)(g_cx+140),(float)(sy+18),(float)(g_cw-156),1,0);
+    Graphics&g=*g_gfx;
+    float cy=sy+22.f;
+    float ex=TxtSp(g,t,fXS,C::Dim,(float)(SW+16),cy,1.3f);
+    FRR(g,C::Sep,ex+10,cy,(float)(WW-18)-(ex+10),1,0);
 }
-static void AT(const wchar_t*l,bool*v,int&y){
-    int s=CTS(y);if(Vis(y,44))DrawTog(l,*v,s);
-    Ctrl c;c.k=CK_T;c.r={(LONG)g_cx,(LONG)s,(LONG)(g_cx+g_cw),(LONG)(s+44)};c.bp=v;
-    g_ctrls.push_back(c);y+=44;
+
+static void AT(const wchar_t*l,bool*v,int&y,const wchar_t*key=nullptr){
+    if(!Match(l))return;
+    int s=CTS(y);if(Vis(y,RH))DrawTog(l,v,s,key);
+    Ctrl c;c.k=CK_T;c.r={(LONG)SW,(LONG)s,(LONG)WW,(LONG)(s+RH)};c.bp=v;c.lbl=l;
+    g_ctrls.push_back(c);y+=RH;
 }
-static void AS(const wchar_t*l,float*v,float mn,float mx,const wchar_t*u,int&y){
-    int s=CTS(y);if(Vis(y,56))DrawSli(l,*v,mn,mx,u,s);
-    Ctrl c;c.k=CK_S;c.r={(LONG)(g_cx+16),(LONG)(s+28),(LONG)(g_cx+g_cw-16),(LONG)(s+48)};
-    c.fp=v;c.mn=mn;c.mx=mx;g_ctrls.push_back(c);y+=56;
+static void AS(const wchar_t*l,float*v,float mn,float mx,const wchar_t*u,int dec,int&y){
+    if(!Match(l))return;
+    int s=CTS(y);
+    float tl=(float)(RX-64-SLW),tw=(float)SLW;
+    if(Vis(y,RH))DrawSli(l,*v,mn,mx,u,dec,s,tl,tw);
+    Ctrl c;c.k=CK_S;c.r={(LONG)(tl-9),(LONG)(s+4),(LONG)(tl+tw+9),(LONG)(s+RH-4)};
+    c.fp=v;c.mn=mn;c.mx=mx;c.tl=tl;c.tw=tw;c.dec=dec;c.lbl=l;
+    g_ctrls.push_back(c);y+=RH;
 }
 static void AC(const wchar_t*l,int*v,const wchar_t**opts,int cnt,int&y){
-    int s=CTS(y);if(Vis(y,44))DrawCyc(l,*v,opts,cnt,s);
-    Ctrl c;c.k=CK_C;float bx=g_cx+g_cw-162.f;
-    c.r={(LONG)bx,(LONG)(s+8),(LONG)((int)bx+146),(LONG)(s+36)};
-    c.ip=v;c.cnt=cnt;g_ctrls.push_back(c);y+=44;
+    if(!Match(l))return;
+    int s=CTS(y);
+    RECT br={(LONG)(RX-DDW),(LONG)(s+(RH-DDH)/2),(LONG)RX,(LONG)(s+(RH-DDH)/2+DDH)};
+    bool open=g_dd.on&&g_dd.ip==v;
+    if(Vis(y,RH))DrawCyc(l,*v,opts,cnt,s,br,open);
+    Ctrl c;c.k=CK_C;c.r=br;c.ip=v;c.cnt=cnt;c.opts=opts;c.lbl=l;
+    g_ctrls.push_back(c);y+=RH;
 }
-static void ASec(const wchar_t*t,int&y){int s=CTS(y);if(Vis(y,36))DrawSec(t,s);y+=36;}
+static void ASec(const wchar_t*t,int&y){
+    if(!g_search.empty())return;               // no section headers while searching
+    int s=CTS(y);if(Vis(y,SEC_H))DrawSec(t,s);
+    y+=SEC_H;
+}
 
-static const wchar_t* TABs[] ={L"Aimbot",L"Visual",L"Misc"};
+static const wchar_t* TABs[] ={L"Visual",L"Aimbot",L"Misc"};
+static const int      TABIC[]={ICN_EYE,ICN_AIM,ICN_STAR};
 static const wchar_t* BONEs[]={L"Head",L"Neck",L"Chest",L"Pelvis"};
 static const wchar_t* TRIs[] ={L"Hold",L"Toggle",L"Always On"};
 static const wchar_t* BOXs[] ={L"None",L"2D Box",L"3D Box",L"Corner"};
 
-static void RenderFrame(Graphics&g){
-    g_gfx=&g;
-    g.SetSmoothingMode(SmoothingModeAntiAlias);
-    g.SetTextRenderingHint(TextRenderingHintClearTypeGridFit);
-
-    FRR(g,C::Bg,  0,0,(float)WW,(float)WH,0);
-    FRR(g,C::Side,0,0,(float)SW,(float)WH,0);
-    FRR(g,C::Hdr, (float)SW,0,(float)(WW-SW),(float)HH,0);
-
-    // Logo + title
-    if(g_logo_img) g.DrawImage(g_logo_img,RectF(10,9,32,32));
-    Txt(g,L"BLACKFADE",fBig,C::Wht,46,10,(float)(SW-56),26);
-    Txt(g,L"v0.1  External",fSm,C::Sub,46,32,(float)(SW-56),18);
-    FRR(g,C::Sep,12,58,(float)(SW-24),1,0);
-
-    for(int i=0;i<3;i++){
-        float ty=70.f+i*46.f;bool act=(i==g_tab);
-        if(act){FRR(g,C::Acc,8,ty,(float)(SW-16),38,8);FRR(g,C::Wht,8,ty,3,38,2);}
-        Txt(g,TABs[i],fMed,act?C::Wht:C::Sub,24,ty,(float)(SW-36),38);
-    }
-    wchar_t eb[32];swprintf(eb,32,L"Enemies: %d",g_ec.load());
-    Txt(g,eb,fSm,C::Sub,12,(float)(WH-30),(float)(SW-24),18);
-
-    Txt(g,TABs[g_tab],fBig,C::Wht,(float)(SW+18),0,200,(float)HH);
-    Txt(g,L"\u00D7",fBig,C::Sub,(float)(WW-48),0,42,(float)HH,StringAlignmentCenter);
-    FRR(g,C::Sep,(float)SW,(float)(HH-1),(float)(WW-SW),1,0);
-
-    Region clip(RectF((float)SW,(float)HH,(float)(WW-SW),(float)(WH-HH)));
-    g.SetClip(&clip);
-    FRR(g,C::Bg,(float)SW,(float)HH,(float)(WW-SW),(float)(WH-HH),0);
-    g_ctrls.clear();
-    int y=4;
-
-    switch(g_tab){
+static void BuildTab(int tab,int&y){
+    switch(tab){
     case 0:
-        ASec(L"AIMBOT",y);
-        AT(L"Aimbot (hold RMB)",&cfg.aOn,y);
-        AS(L"FOV Value",&cfg.aFov,0,500,L"px",y);
-        AT(L"NoSleep Aimbot",&cfg.aNs,y);
-        AT(L"Knock Check",&cfg.aKc,y);
-        AT(L"Nearest Part",&cfg.aNp,y);
-        AS(L"Smoothing",&cfg.aSm,1,100,L"%",y);
-        AC(L"Aim Bone",&cfg.aBone,BONEs,4,y);
-        y+=8;
-        ASec(L"SILENT AIM",y);
-        AT(L"Silent Aim",&cfg.sOn,y);
-        AS(L"FOV Silent",&cfg.sFov,0,300,L"px",y);
-        AT(L"Predict",&cfg.sPr,y);
-        if(cfg.sPr){AS(L"Predict X",&cfg.sPx,0,1,L"",y);AS(L"Predict Y",&cfg.sPy,0,1,L"",y);}
-        y+=8;
-        ASec(L"TRIGGERBOT",y);
-        AT(L"TriggerBot",&cfg.tOn,y);
-        AC(L"Type",&cfg.tTy,TRIs,3,y);
-        AS(L"Shot Delay",&cfg.tSd,0,500,L"ms",y);
-        AS(L"Release Delay",&cfg.tRd,0,500,L"ms",y);
-        AT(L"Head Only",&cfg.tHo,y);
-        AT(L"Team Check",&cfg.tTc,y);
-        AT(L"Burst Mode",&cfg.tBu,y);
-        if(cfg.tBu)AS(L"Burst Shots",&cfg.tBs,1,10,L"",y);
-        break;
-    case 1:
         ASec(L"ESP",y);
         AT(L"ESP",&cfg.eOn,y);
         AC(L"Box Type",&cfg.eBx,BOXs,4,y);
@@ -4368,47 +4532,179 @@ static void RenderFrame(Graphics&g){
         AT(L"Name",&cfg.eNm,y);
         AT(L"Healthbar",&cfg.eHb,y);
         AT(L"Distance",&cfg.eDi,y);
-        AS(L"Max Distance",&cfg.eDst,50,1000,L"m",y);
-        y+=8;
+        AS(L"Max Distance",&cfg.eDst,50,1000,L"m",0,y);
         ASec(L"ESP FILTERS",y);
         AT(L"Team Check",&cfg.eTc,y);
         AT(L"NPC Check",&cfg.eNpc,y);
         AT(L"Health Check",&cfg.eHc,y);
         break;
+    case 1:
+        ASec(L"AIMBOT",y);
+        AT(L"Aimbot",&cfg.aOn,y,L"RMB");
+        AS(L"FOV Value",&cfg.aFov,0,500,L"px",0,y);
+        AS(L"Smoothing",&cfg.aSm,1,100,L"%",0,y);
+        AC(L"Aim Bone",&cfg.aBone,BONEs,4,y);
+        AT(L"NoSleep Aimbot",&cfg.aNs,y);
+        AT(L"Knock Check",&cfg.aKc,y);
+        AT(L"Nearest Part",&cfg.aNp,y);
+        ASec(L"SILENT AIM",y);
+        AT(L"Silent Aim",&cfg.sOn,y);
+        AS(L"FOV Silent Value",&cfg.sFov,0,300,L"px",0,y);
+        AT(L"Predict Silent",&cfg.sPr,y);
+        AS(L"Predict Silent X",&cfg.sPx,0,1,L"",3,y);
+        AS(L"Predict Silent Y",&cfg.sPy,0,1,L"",3,y);
+        ASec(L"TRIGGERBOT",y);
+        AT(L"TriggerBot",&cfg.tOn,y);
+        AC(L"Type TriggerBot",&cfg.tTy,TRIs,3,y);
+        AS(L"Shot Delay",&cfg.tSd,0,500,L"ms",0,y);
+        AS(L"Release Delay",&cfg.tRd,0,500,L"ms",0,y);
+        AT(L"Head Only",&cfg.tHo,y);
+        AT(L"Team Check",&cfg.tTc,y);
+        AT(L"Burst Mode",&cfg.tBu,y);
+        AS(L"Burst Shots",&cfg.tBs,1,10,L"",0,y);
+        break;
     default:
         ASec(L"MOVEMENT",y);
-        AT(L"Bunnyhop (Space)",&cfg.mBh,y);
+        AT(L"Bunnyhop",&cfg.mBh,y,L"Space");
         AT(L"Speed Hack",&cfg.mSh,y);
-        if(cfg.mSh)AS(L"Speed Mult",&cfg.mSm,1,5,L"x",y);
-        y+=8;
+        AS(L"Speed Mult",&cfg.mSm,1,5,L"x",1,y);
         ASec(L"NETWORK",y);
         AT(L"Fake Lag",&cfg.mFl,y);
-        if(cfg.mFl)AS(L"Lag Amount",&cfg.mFla,1,20,L"",y);
-        y+=8;
+        AS(L"Lag Amount",&cfg.mFla,1,20,L"",0,y);
         ASec(L"PERFORMANCE",y);
-        AS(L"FPS Cap",&cfg.mFps,10,240,L"fps",y);
+        AS(L"FPS Cap",&cfg.mFps,10,240,L"fps",0,y);
         break;
     }
+}
 
-    y+=16;
+static void IconBtn(Graphics&g,const RECT&r,int ic,bool active,bool hv){
+    float x=(float)r.left,y=(float)r.top,w=(float)(r.right-r.left),h=(float)(r.bottom-r.top);
+    FRR(g,active?C::AccBg:(hv?C::Hov:C::Item),x,y,w,h,8);
+    DRR(g,active?C::Acc:(hv?Lerp(C::Brd,C::Acc,.35f):C::Brd),x,y,w,h,8);
+    Icon(g,ic,x+w*.5f,y+h*.5f,15,active?Lerp(C::Acc,C::Wht,.35f):(hv?C::Txt:C::Sub),1.4f);
+}
+
+static void DrawDD(Graphics&g){
+    if(!g_dd.on)return;
+    RECT r=DDRect();
+    float x=(float)r.left,y=(float)r.top,w=(float)(r.right-r.left),h=(float)(r.bottom-r.top);
+    FRR(g,C::Side,x,y,w,h,8);DRR(g,C::Brd,x,y,w,h,8);
+    int sel=Wrap(*g_dd.ip,g_dd.cnt);
+    for(int i=0;i<g_dd.cnt;i++){
+        float iy=y+4+i*28.f;
+        RECT ir={(LONG)x,(LONG)iy,(LONG)(x+w),(LONG)(iy+28)};
+        if(InR(ir,g_mx,g_my))FRR(g,C::Hov,x+4,iy,w-8,28,6);
+        Txt(g,g_dd.o[i],fMed,i==sel?C::Acc:C::Txt,x+14,iy,w-24,28);
+    }
+}
+static void DrawToast(Graphics&g){
+    if(g_toast.empty())return;
+    ULONGLONG age=GetTickCount64()-g_toastT;
+    if(age>1900){g_toast.clear();return;}
+    g_busy=true;
+    float al=age>1500?(1900.f-(float)age)/400.f:1.f;
+    float w=TextW(g,g_toast.c_str(),fSm)+38,h=30,x=SW+(WW-SW-w)*.5f,y=(float)WH-54;
+    FRR(g,Color((BYTE)(245*al),14,20,42),x,y,w,h,8);
+    DRR(g,Color((BYTE)(255*al),62,132,247),x,y,w,h,8);
+    Txt(g,g_toast.c_str(),fSm,Color((BYTE)(255*al),226,231,246),x,y,w,h,StringAlignmentCenter);
+}
+
+// ---- frame -----------------------------------------------------------------
+static void RenderFrame(Graphics&g){
+    g_gfx=&g;g_busy=false;
+    g.SetSmoothingMode(SmoothingModeAntiAlias);
+    g.SetTextRenderingHint(TextRenderingHintClearTypeGridFit);
+    g.SetInterpolationMode(InterpolationModeHighQualityBicubic);
+
+    FRR(g,C::Bg,0,0,(float)WW,(float)WH,0);
+    FRR(g,C::Side,0,0,(float)SW,(float)WH,0);
+    FRR(g,C::Sep,0,(float)(HH-1),(float)WW,1,0);
+    FRR(g,C::Sep,(float)(SW-1),(float)HH,1,(float)(WH-HH),0);
+
+    // ---- header ----
+    TxtSp(g,L"CONTROL PANEL",fXS,C::Sub,18,HH*.5f,1.4f);
+    HdrRects hr=HdrR();
+    {
+        float sx=(float)hr.search.left,sy=(float)hr.search.top,sw=(float)(hr.search.right-hr.search.left),sh=(float)(hr.search.bottom-hr.search.top);
+        FRR(g,C::Item,sx,sy,sw,sh,8);
+        DRR(g,g_sfocus?C::Acc:C::Brd,sx,sy,sw,sh,8);
+        Icon(g,ICN_SEARCH,sx+16,sy+sh*.5f,13,g_sfocus?C::Acc:C::Sub,1.3f);
+        float tx=sx+31;
+        if(g_search.empty()){
+            if(!g_sfocus)Txt(g,L"Search...",fSm,C::Dim,tx,sy,sw-40,sh);
+        }else Txt(g,g_search.c_str(),fSm,C::Txt,tx,sy,sw-40,sh);
+        if(g_sfocus&&((GetTickCount64()/500)%2==0)){
+            float cx2=tx+(g_search.empty()?0.f:TextW(g,g_search.c_str(),fSm))+1;
+            if(cx2>sx+sw-10)cx2=sx+sw-10;
+            Pen cp(C::Txt,1.f);g.DrawLine(&cp,cx2,sy+7,cx2,sy+sh-7);
+        }
+    }
+    IconBtn(g,hr.mon,  ICN_MON,  cfg.eOn,InR(hr.mon,  g_mx,g_my));
+    IconBtn(g,hr.bell, ICN_BELL, g_notif,InR(hr.bell, g_mx,g_my));
+    IconBtn(g,hr.globe,ICN_GLOBE,false,  InR(hr.globe,g_mx,g_my));
+    IconBtn(g,hr.gear, ICN_GEAR, false,  InR(hr.gear, g_mx,g_my));
+
+    // ---- sidebar: logo + name + version ----
+    if(g_logo_img)g.DrawImage(g_logo_img,RectF(16,(float)HH+14,34,34));
+    TxtSp(g,L"BLACKFADE",fTitle,C::Wht,60,(float)HH+23,1.2f);
+    Txt(g,L"v0.1",fXS,C::Sub,60,(float)HH+31,100,16);
+
+    for(int i=0;i<3;i++){
+        RECT nr=NavR(i);float ty=(float)nr.top;
+        bool act=(i==g_tab),hv=!g_dd.on&&InR(nr,g_mx,g_my);
+        if(act){
+            FRR(g,C::Act,(float)nr.left,ty,(float)(nr.right-nr.left),(float)NAVH,8);
+            FRR(g,C::Acc,0,ty+7,3,(float)(NAVH-14),1.5f);
+        }else if(hv)FRR(g,C::Hov,(float)nr.left,ty,(float)(nr.right-nr.left),(float)NAVH,8);
+        Color col=act?C::Wht:(hv?C::Txt:C::Sub);
+        Icon(g,TABIC[i],28.f,ty+NAVH*.5f,16.f,col,1.5f);
+        Txt(g,TABs[i],fMed,col,46,ty,(float)(SW-60),(float)NAVH);
+    }
+    {
+        RECT er=ExitR();bool eh=!g_dd.on&&InR(er,g_mx,g_my);
+        Color ec=eh?C::Red:C::Sub;
+        if(eh)FRR(g,Color(255,34,16,28),(float)er.left,(float)er.top,(float)(er.right-er.left),(float)NAVH,8);
+        Icon(g,ICN_POWER,28.f,er.top+NAVH*.5f,16.f,ec,1.5f);
+        Txt(g,L"Exit",fMed,ec,46,(float)er.top,(float)(SW-60),(float)NAVH);
+    }
+    wchar_t eb[32];swprintf(eb,32,L"Enemies: %d",g_ec.load());
+    Txt(g,eb,fSm,C::Dim,20,(float)(WH-46),(float)(SW-30),22);
+
+    // ---- content (clipped + scrollable) ----
+    Region clip(RectF((float)SW,(float)HH,(float)(WW-SW),(float)(WH-HH)));
+    g.SetClip(&clip);
+    g_ctrls.clear();
+    int y=6;
+    if(g_search.empty())BuildTab(g_tab,y);
+    else{
+        for(int t=0;t<3;t++)BuildTab(t,y);
+        if(y==6)Txt(g,L"No results",fMed,C::Dim,(float)SW,(float)(HH+40),(float)(WW-SW),24,StringAlignmentCenter);
+    }
+    y+=12;
     g_msy=(std::max)(0,y-(WH-HH));
     g_sy =(std::max)(0,(std::min)(g_sy,g_msy));
-    g.ResetClip();
-    DRR(g,C::Brd,.5f,.5f,(float)(WW-1),(float)(WH-1),10,1.5f);
     if(g_msy>0){
-        float vh=(float)(WH-HH);
+        float vh=(float)(WH-HH-8);
         float bh=(std::max)(32.f,vh*vh/(float)y);
-        float by=HH+(float)g_sy/(float)g_msy*(vh-bh);
-        FRR(g,C::Acc,(float)(WW-6),by,4,bh,2);
+        float by=HH+4+(float)g_sy/(float)g_msy*(vh-bh);
+        FRR(g,C::Item,(float)(WW-8),(float)(HH+4),4,vh,2);
+        FRR(g,Lerp(C::Brd,C::Acc,.25f),(float)(WW-8),by,4,bh,2);
     }
+    g.ResetClip();
+
+    DrawDD(g);
+    DrawToast(g);
+    DRR(g,C::Brd,.5f,.5f,(float)(WW-1),(float)(WH-1),10,1.f);
     g_gfx=nullptr;
 }
 
 static void UpdDrag(int mx){
-    float tx=(float)g_drag.r.left,tw=(float)(g_drag.r.right-g_drag.r.left);
-    if(tw<1)return;
-    float t=(std::max)(0.f,(std::min)(1.f,(mx-tx)/tw));
-    *g_drag.fp=g_drag.mn+t*(g_drag.mx-g_drag.mn);
+    if(!g_drag.fp||g_drag.tw<1)return;
+    float t=(std::max)(0.f,(std::min)(1.f,((float)mx-g_drag.tl)/g_drag.tw));
+    float v=g_drag.mn+t*(g_drag.mx-g_drag.mn);
+    float st=g_drag.dec>0?std::pow(10.f,(float)-g_drag.dec):1.f;
+    v=std::round(v/st)*st;
+    *g_drag.fp=(std::max)(g_drag.mn,(std::min)(g_drag.mx,v));
 }
 
 LRESULT CALLBACK WndProc(HWND hw,UINT msg,WPARAM wp,LPARAM lp){
@@ -4423,47 +4719,96 @@ LRESULT CALLBACK WndProc(HWND hw,UINT msg,WPARAM wp,LPARAM lp){
         SelectObject(mdc,ob);DeleteObject(bmp);DeleteDC(mdc);
         EndPaint(hw,&ps);return 0;
     }
+    case WM_ERASEBKGND:return 1;
     case WM_NCHITTEST:{
-        POINT pt;GetCursorPos(&pt);ScreenToClient(hw,&pt);
-        if(pt.x<SW||pt.y<HH)return HTCAPTION;
-        return HTCLIENT;
+        // drag by blank header/sidebar only - interactive spots must stay HTCLIENT
+        POINT pt={(short)LOWORD(lp),(short)HIWORD(lp)};ScreenToClient(hw,&pt);
+        if(pt.x>=SW&&pt.y>=HH)return HTCLIENT;
+        HdrRects hr=HdrR();
+        if(InR(hr.search,pt.x,pt.y)||InR(hr.mon,pt.x,pt.y)||InR(hr.bell,pt.x,pt.y)||
+           InR(hr.globe,pt.x,pt.y)||InR(hr.gear,pt.x,pt.y))return HTCLIENT;
+        for(int i=0;i<3;i++)if(InR(NavR(i),pt.x,pt.y))return HTCLIENT;
+        if(InR(ExitR(),pt.x,pt.y))return HTCLIENT;
+        return HTCAPTION;
     }
+    case WM_NCLBUTTONDOWN:g_sfocus=false;g_dd.on=false;break;
+    case WM_KILLFOCUS:g_sfocus=false;InvalidateRect(hw,nullptr,FALSE);return 0;
     case WM_LBUTTONDOWN:{
         int mx=(short)LOWORD(lp),my=(short)HIWORD(lp);
-        for(int i=0;i<3;i++){
-            int ty=70+i*46;
-            if(mx>=8&&mx<=SW-8&&my>=ty&&my<ty+38){g_tab=i;g_sy=0;InvalidateRect(hw,nullptr,FALSE);return 0;}
+        // open dropdown eats the click
+        if(g_dd.on){
+            RECT r=DDRect();
+            if(InR(r,mx,my)){
+                int i=(my-(r.top+4))/28;
+                if(i>=0&&i<g_dd.cnt){
+                    *g_dd.ip=i;
+                    Toast((std::wstring(g_dd.lbl)+L": "+g_dd.o[i]).c_str());
+                }
+            }
+            g_dd.on=false;InvalidateRect(hw,nullptr,FALSE);return 0;
         }
-        if(mx>WW-50&&my<HH){SaveCfg();PostQuitMessage(0);return 0;}
+        HdrRects hr=HdrR();
+        g_sfocus=InR(hr.search,mx,my);
+        if(g_sfocus){SetFocus(hw);InvalidateRect(hw,nullptr,FALSE);return 0;}
+        if(InR(hr.mon,mx,my)){cfg.eOn=!cfg.eOn;ToastOnOff(L"ESP",cfg.eOn);InvalidateRect(hw,nullptr,FALSE);return 0;}
+        if(InR(hr.bell,mx,my)){g_notif=!g_notif;if(g_notif)Toast(L"Notifications on",true);InvalidateRect(hw,nullptr,FALSE);return 0;}
+        if(InR(hr.globe,mx,my))return 0;
+        if(InR(hr.gear,mx,my)){SaveCfg();Toast(L"Config saved");InvalidateRect(hw,nullptr,FALSE);return 0;}
+        for(int i=0;i<3;i++)if(InR(NavR(i),mx,my)){g_tab=i;g_sy=0;g_search.clear();InvalidateRect(hw,nullptr,FALSE);return 0;}
+        if(InR(ExitR(),mx,my)){SaveCfg();PostQuitMessage(0);return 0;}
+        if(mx<SW||my<HH)return 0;
         for(auto&c:g_ctrls){
-            POINT pt={mx,my};if(!PtInRect(&c.r,pt))continue;
-            if(c.k==CK_T){*c.bp=!*c.bp;InvalidateRect(hw,nullptr,FALSE);return 0;}
-            if(c.k==CK_S){g_drag={true,c.fp,c.r,c.mn,c.mx};SetCapture(hw);UpdDrag(mx);InvalidateRect(hw,nullptr,FALSE);return 0;}
+            if(!InR(c.r,mx,my))continue;
+            if(c.k==CK_T){*c.bp=!*c.bp;ToastOnOff(c.lbl,*c.bp);InvalidateRect(hw,nullptr,FALSE);return 0;}
+            if(c.k==CK_S){
+                g_drag.on=true;g_drag.fp=c.fp;g_drag.tl=c.tl;g_drag.tw=c.tw;
+                g_drag.mn=c.mn;g_drag.mx=c.mx;g_drag.dec=c.dec;
+                SetCapture(hw);UpdDrag(mx);InvalidateRect(hw,nullptr,FALSE);return 0;
+            }
             if(c.k==CK_C){
-                int mid=(c.r.left+c.r.right)/2;
-                if(mx<mid)*c.ip=(*c.ip-1+c.cnt)%c.cnt;
-                else      *c.ip=(*c.ip+1)%c.cnt;
+                g_dd.on=true;g_dd.box=c.r;g_dd.ip=c.ip;g_dd.o=c.opts;g_dd.cnt=c.cnt;g_dd.lbl=c.lbl;
                 InvalidateRect(hw,nullptr,FALSE);return 0;
             }
         }
         return 0;
     }
     case WM_MOUSEMOVE:
-        if(g_drag.on){UpdDrag((short)LOWORD(lp));InvalidateRect(hw,nullptr,FALSE);}
+        g_mx=(short)LOWORD(lp);g_my=(short)HIWORD(lp);
+        if(g_drag.on)UpdDrag(g_mx);
+        InvalidateRect(hw,nullptr,FALSE);
         return 0;
     case WM_LBUTTONUP:
         if(g_drag.on){g_drag.on=false;ReleaseCapture();}
         return 0;
+    case WM_CHAR:
+        if(g_sfocus){
+            wchar_t ch=(wchar_t)wp;
+            if(ch==8){if(!g_search.empty())g_search.pop_back();}
+            else if(ch==27){g_search.clear();g_sfocus=false;}
+            else if(ch==13){g_sfocus=false;}
+            else if(ch>=32&&g_search.size()<32)g_search.push_back(ch);
+            g_sy=0;InvalidateRect(hw,nullptr,FALSE);
+        }
+        return 0;
     case WM_MOUSEWHEEL:{
-        POINT pt;pt.x=LOWORD(lp);pt.y=HIWORD(lp);ScreenToClient(hw,&pt);
+        POINT pt={(short)LOWORD(lp),(short)HIWORD(lp)};ScreenToClient(hw,&pt);
         if(pt.x>SW){
+            g_dd.on=false;
             g_sy-=GET_WHEEL_DELTA_WPARAM(wp)/3;
             g_sy=(std::max)(0,(std::min)(g_sy,g_msy));
             InvalidateRect(hw,nullptr,FALSE);
         }
         return 0;
     }
-    case WM_TIMER:InvalidateRect(hw,nullptr,FALSE);return 0;
+    case WM_TIMER:{
+        // hover polling (blank header/sidebar are HTCAPTION so no WM_MOUSEMOVE there)
+        POINT pt;GetCursorPos(&pt);ScreenToClient(hw,&pt);
+        if(pt.x<0||pt.y<0||pt.x>=WW||pt.y>=WH){pt.x=-1;pt.y=-1;}
+        bool moved=(pt.x!=g_mx||pt.y!=g_my);
+        g_mx=pt.x;g_my=pt.y;
+        if(moved||g_busy||g_sfocus)InvalidateRect(hw,nullptr,FALSE);
+        return 0;
+    }
     case WM_DESTROY:SaveCfg();PostQuitMessage(0);return 0;
     }
     return DefWindowProc(hw,msg,wp,lp);
@@ -4513,9 +4858,9 @@ int APIENTRY WinMain(HINSTANCE hI,HINSTANCE,LPSTR,int){
         L"BFW",L"Blackfade",
         WS_POPUP|WS_VISIBLE,gx,gy,WW,WH,nullptr,nullptr,hI,nullptr);
     int cp=2;DwmSetWindowAttribute(g_hwnd,33,&cp,sizeof(cp));
-    HRGN rgn=CreateRoundRectRgn(0,0,WW+1,WH+1,12,12);
+    HRGN rgn=CreateRoundRectRgn(0,0,WW+1,WH+1,20,20);
     SetWindowRgn(g_hwnd,rgn,TRUE);
-    SetTimer(g_hwnd,1,100,nullptr);
+    SetTimer(g_hwnd,1,33,nullptr);
 
     std::thread th(Logic);
     MSG m{};
